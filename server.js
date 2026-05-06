@@ -1,0 +1,429 @@
+// ============================================
+// BDnet Backend API
+// Node.js + Express + Supabase
+// ============================================
+
+const express = require('express');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+const Anthropic = require('@anthropic-ai/sdk');
+require('dotenv').config();
+
+const app = express();
+app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+app.use(express.json());
+
+// ── Clients ──────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY   // service key for server-side ops
+);
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ── Auth Middleware ───────────────────────────
+async function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ error: 'Invalid token' });
+  req.user = user;
+  next();
+}
+
+// ============================================
+// AUTH ROUTES
+// ============================================
+
+// Sign up
+app.post('/auth/signup', async (req, res) => {
+  try {
+    const { email, password, full_name, username, user_type } = req.body;
+
+    // Check username taken
+    const { data: existing } = await supabase
+      .from('profiles').select('id').eq('username', username).single();
+    if (existing) return res.status(400).json({ error: 'Username already taken' });
+
+    // Create auth user
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+      email, password, email_confirm: true
+    });
+    if (authError) return res.status(400).json({ error: authError.message });
+
+    const userId = authData.user.id;
+
+    // Create base profile
+    const { error: profileError } = await supabase.from('profiles').insert({
+      id: userId, full_name, username, user_type
+    });
+    if (profileError) return res.status(400).json({ error: profileError.message });
+
+    // Create type-specific profile
+    if (user_type === 'bd') {
+      await supabase.from('bd_profiles').insert({ id: userId });
+    } else if (user_type === 'project') {
+      await supabase.from('project_profiles').insert({ id: userId, project_name: full_name });
+    } else if (user_type === 'blockchain') {
+      await supabase.from('blockchain_profiles').insert({ id: userId, chain_name: full_name });
+    } else if (user_type === 'vc') {
+      await supabase.from('vc_profiles').insert({ id: userId, firm_name: full_name });
+    }
+
+    res.json({ success: true, userId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Sign in
+app.post('/auth/signin', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ session: data.session, user: data.user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// PROFILE ROUTES
+// ============================================
+
+// Get all profiles (for discover)
+app.get('/profiles', async (req, res) => {
+  try {
+    const { type, limit = 50, offset = 0 } = req.query;
+    
+    let query = supabase.from('profiles').select(`
+      *,
+      bd_profiles(*),
+      project_profiles(*),
+      blockchain_profiles(*),
+      vc_profiles(*)
+    `).range(offset, offset + limit - 1).order('is_featured', { ascending: false });
+
+    if (type) query = query.eq('user_type', type);
+
+    const { data, error } = await query;
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get single profile
+app.get('/profiles/:username', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('profiles').select(`
+      *,
+      bd_profiles(*),
+      project_profiles(*),
+      blockchain_profiles(*),
+      vc_profiles(*)
+    `).eq('username', req.params.username).single();
+
+    if (error) return res.status(404).json({ error: 'Profile not found' });
+
+    // Increment view count
+    await supabase.from('profiles')
+      .update({ views_count: (data.views_count || 0) + 1 })
+      .eq('id', data.id);
+
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update profile
+app.put('/profiles/me', requireAuth, async (req, res) => {
+  try {
+    const { profile, typeProfile } = req.body;
+    const userId = req.user.id;
+
+    // Update base profile
+    if (profile) {
+      const { error } = await supabase.from('profiles')
+        .update(profile).eq('id', userId);
+      if (error) return res.status(400).json({ error: error.message });
+    }
+
+    // Update type-specific profile
+    if (typeProfile) {
+      const { data: base } = await supabase.from('profiles')
+        .select('user_type').eq('id', userId).single();
+      
+      const table = {
+        bd: 'bd_profiles', project: 'project_profiles',
+        blockchain: 'blockchain_profiles', vc: 'vc_profiles'
+      }[base.user_type];
+
+      if (table) {
+        const { error } = await supabase.from(table)
+          .update(typeProfile).eq('id', userId);
+        if (error) return res.status(400).json({ error: error.message });
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// AI SEARCH ROUTE (core feature)
+// ============================================
+app.post('/search/ai', async (req, res) => {
+  try {
+    const { query, userId } = req.body;
+
+    // Fetch all profiles for context
+    const { data: profiles } = await supabase.from('profiles').select(`
+      id, full_name, username, user_type, bio, is_verified,
+      bd_profiles(skills, networks, chains, specializations, total_deals, rating, availability),
+      project_profiles(project_name, category, chain, stage, seeking, budget_range, is_urgent, tagline),
+      blockchain_profiles(chain_name, chain_type, seeking, grant_available, grant_size),
+      vc_profiles(firm_name, investment_focus, investment_stage, check_size)
+    `);
+
+    // Build context for AI
+    const profileContext = profiles.map(p => ({
+      id: p.id,
+      username: p.username,
+      name: p.full_name,
+      type: p.user_type,
+      bio: p.bio,
+      ...(p.bd_profiles || {}),
+      ...(p.project_profiles || {}),
+      ...(p.blockchain_profiles || {}),
+      ...(p.vc_profiles || {})
+    }));
+
+    const message = await anthropic.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 1024,
+      system: `You are BDnet's AI search engine for Web3 business development.
+      
+Given a natural language query, analyze what the user truly needs and find the best matches from the platform's users.
+
+User types: bd (BD professional), project (startup/project), blockchain (L1/L2 ecosystem), vc (investor/VC)
+
+Available profiles: ${JSON.stringify(profileContext)}
+
+Return ONLY valid JSON in this exact format:
+{
+  "summary": "1-2 sentence explanation of what you found and why",
+  "matches": ["uuid1", "uuid2", "uuid3"],
+  "intent": "what the user is looking for",
+  "suggested_filters": ["filter1", "filter2"]
+}
+
+Be smart: understand context, not just keywords. "I need funding" = find VCs and blockchain grants. "CEX listing" = find BD pros with exchange networks. "L2 integration" = find blockchain ecosystem profiles.`,
+      messages: [{ role: 'user', content: query }]
+    });
+
+    const responseText = message.content[0].text;
+    let parsed;
+    try {
+      parsed = JSON.parse(responseText);
+    } catch {
+      parsed = { summary: 'Found relevant profiles', matches: [], intent: query };
+    }
+
+    // Fetch matched profiles
+    let matchedProfiles = [];
+    if (parsed.matches && parsed.matches.length > 0) {
+      const { data: matched } = await supabase.from('profiles').select(`
+        *,
+        bd_profiles(*),
+        project_profiles(*),
+        blockchain_profiles(*),
+        vc_profiles(*)
+      `).in('id', parsed.matches);
+      matchedProfiles = matched || [];
+    }
+
+    // Log search
+    if (userId) {
+      await supabase.from('search_logs').insert({
+        user_id: userId,
+        query,
+        results_count: matchedProfiles.length,
+        result_ids: parsed.matches || []
+      });
+    }
+
+    res.json({
+      summary: parsed.summary,
+      intent: parsed.intent,
+      suggested_filters: parsed.suggested_filters || [],
+      results: matchedProfiles
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// CONNECTIONS ROUTES
+// ============================================
+
+// Send connection request
+app.post('/connections', requireAuth, async (req, res) => {
+  try {
+    const { receiver_id, message } = req.body;
+    const { data, error } = await supabase.from('connections').insert({
+      requester_id: req.user.id,
+      receiver_id,
+      message,
+      status: 'pending'
+    }).select().single();
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get my connections
+app.get('/connections/me', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { data, error } = await supabase.from('connections')
+      .select(`*, requester:profiles!requester_id(*), receiver:profiles!receiver_id(*)`)
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`)
+      .eq('status', 'accepted');
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get pending requests
+app.get('/connections/pending', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('connections')
+      .select(`*, requester:profiles!requester_id(*)`)
+      .eq('receiver_id', req.user.id)
+      .eq('status', 'pending');
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Accept / decline connection
+app.put('/connections/:id', requireAuth, async (req, res) => {
+  try {
+    const { status } = req.body; // 'accepted' or 'declined'
+    const { data, error } = await supabase.from('connections')
+      .update({ status })
+      .eq('id', req.params.id)
+      .eq('receiver_id', req.user.id)
+      .select().single();
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// POSTS / FEED ROUTES
+// ============================================
+
+// Get feed
+app.get('/posts', async (req, res) => {
+  try {
+    const { limit = 20, offset = 0, type } = req.query;
+    let query = supabase.from('posts')
+      .select(`*, author:profiles(id, full_name, username, user_type, avatar_url, bd_profiles(rating), project_profiles(project_name))`)
+      .range(offset, offset + limit - 1)
+      .order('created_at', { ascending: false });
+
+    if (type) query = query.eq('post_type', type);
+
+    const { data, error } = await query;
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create post
+app.post('/posts', requireAuth, async (req, res) => {
+  try {
+    const { content, post_type, tags } = req.body;
+    const { data, error } = await supabase.from('posts').insert({
+      author_id: req.user.id, content, post_type, tags
+    }).select().single();
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Like / unlike post
+app.post('/posts/:id/like', requireAuth, async (req, res) => {
+  try {
+    const { data: existing } = await supabase.from('post_likes')
+      .select().eq('post_id', req.params.id).eq('user_id', req.user.id).single();
+
+    if (existing) {
+      await supabase.from('post_likes')
+        .delete().eq('post_id', req.params.id).eq('user_id', req.user.id);
+      res.json({ liked: false });
+    } else {
+      await supabase.from('post_likes').insert({ post_id: req.params.id, user_id: req.user.id });
+      res.json({ liked: true });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// STATS ROUTE
+// ============================================
+app.get('/stats', async (req, res) => {
+  try {
+    const [bds, projects, blockchains, vcs] = await Promise.all([
+      supabase.from('profiles').select('id', { count: 'exact' }).eq('user_type', 'bd'),
+      supabase.from('profiles').select('id', { count: 'exact' }).eq('user_type', 'project'),
+      supabase.from('profiles').select('id', { count: 'exact' }).eq('user_type', 'blockchain'),
+      supabase.from('profiles').select('id', { count: 'exact' }).eq('user_type', 'vc'),
+    ]);
+
+    res.json({
+      bd_count: bds.count || 0,
+      project_count: projects.count || 0,
+      blockchain_count: blockchains.count || 0,
+      vc_count: vcs.count || 0,
+      total: (bds.count || 0) + (projects.count || 0) + (blockchains.count || 0) + (vcs.count || 0)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Health check
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`BDnet API running on port ${PORT}`));
+
+module.exports = app;
